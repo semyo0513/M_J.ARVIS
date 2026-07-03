@@ -1016,18 +1016,51 @@
     function playSoundUntilEnd(filePath) {
       initAudio();
       return new Promise((resolve) => {
+        let isResolved = false;
+        
+        // Safety fallback timeout: resolve in 1.2 seconds anyway to avoid hanging on mobile
+        const safetyTimeout = setTimeout(() => {
+          if (!isResolved) {
+            isResolved = true;
+            console.log('playSoundUntilEnd safety timeout triggered for:', filePath);
+            resolve();
+          }
+        }, 1200);
+
         const sound = new Audio(filePath);
         sound.volume = 0.55;
+        
         sound.onended = () => {
-          resolve();
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(safetyTimeout);
+            resolve();
+          }
         };
+        
         sound.onerror = () => {
-          resolve(); // Resolve anyway to prevent blocking the TTS
+          if (!isResolved) {
+            isResolved = true;
+            clearTimeout(safetyTimeout);
+            resolve(); // Resolve anyway to prevent blocking the TTS
+          }
         };
-        sound.play().catch(e => {
-          console.log('Sound playback blocked or failed:', e);
-          resolve(); // Resolve to allow speaking even if audio is blocked
-        });
+        
+        const playPromise = sound.play();
+        if (playPromise !== undefined) {
+          playPromise.then(() => {
+            // Started playing successfully
+          }).catch(e => {
+            console.log('Sound playback blocked or failed:', e);
+            if (!isResolved) {
+              isResolved = true;
+              clearTimeout(safetyTimeout);
+              resolve(); // Resolve to allow speaking even if audio is blocked
+            }
+          });
+        } else {
+          // Fallback if browser does not return promise
+        }
       });
     }
 
@@ -1456,9 +1489,14 @@
       // 모바일 TTS 권한 획득 (Warm-up 우회 기법)
       // 사용자의 터치 이벤트 루프 안에서 즉시 빈 텍스트를 실행하여 권한을 얻습니다.
       if (window.speechSynthesis) {
-         const unlockUtterance = new SpeechSynthesisUtterance('');
-         unlockUtterance.volume = 0; // 소리 끄기
-         window.speechSynthesis.speak(unlockUtterance);
+        try {
+          window.speechSynthesis.cancel(); // Clear any stuck queue first
+          const unlockUtterance = new SpeechSynthesisUtterance(' ');
+          unlockUtterance.volume = 0.1; // Low volume, silent space
+          window.speechSynthesis.speak(unlockUtterance);
+        } catch (e) {
+          console.log('Failed to prime TTS:', e);
+        }
       }
 
       if (!recognition) {
@@ -1476,7 +1514,9 @@
       } else {
         // If speaking, cancel speaking first
         if (window.speechSynthesis && window.speechSynthesis.speaking) {
-          window.speechSynthesis.cancel();
+          try {
+            window.speechSynthesis.cancel();
+          } catch (e) {}
         }
         try {
           recognition.start();
@@ -1496,9 +1536,22 @@
       }
     }
 
-    // Bind triggers to both central arc reactor and backup mic button
-    arcReactor.addEventListener('click', toggleSpeech);
-    micButton.addEventListener('click', toggleSpeech);
+    // Bind triggers to both central arc reactor and backup mic button with hybrid mobile support
+    let lastTriggerTime = 0;
+    function handleSpeechTrigger(e) {
+      // Prevent double triggers from touchstart + click
+      const now = Date.now();
+      if (now - lastTriggerTime < 500) {
+        return;
+      }
+      lastTriggerTime = now;
+      toggleSpeech();
+    }
+    
+    arcReactor.addEventListener('click', handleSpeechTrigger);
+    arcReactor.addEventListener('touchstart', handleSpeechTrigger, { passive: true });
+    micButton.addEventListener('click', handleSpeechTrigger);
+    micButton.addEventListener('touchstart', handleSpeechTrigger, { passive: true });
 
     // ============================================================
     //  GEMINI API CALL (SERVERLESS FETCH)
@@ -1626,6 +1679,18 @@
       utterance.onstart = () => {
         ttsStarted = true;
         setUIState('speaking');
+        
+        // Safety timeout to prevent getting stuck in "speaking" state if onend is never fired (common iOS bug)
+        const estimatedDuration = (cleanText.length * 200) + 3000; // 200ms per char + 3s buffer
+        setTimeout(() => {
+          if (currentState === 'speaking') {
+            console.log('TTS speaking safety timeout triggered, forcing idle state');
+            try {
+              window.speechSynthesis.cancel();
+            } catch (err) {}
+            setUIState('idle');
+          }
+        }, estimatedDuration);
       };
 
       utterance.onend = () => {
@@ -1637,14 +1702,21 @@
         setUIState('idle');
       };
 
-      window.speechSynthesis.speak(utterance);
-
-      // 모바일 방어 로직: 오디오 차단으로 onstart가 안 불릴 경우를 대비해 강제로 idle 상태 복구
+      // Register the startup safety timeout BEFORE calling speak()
+      // to ensure it runs even if speak() throws synchronously.
       setTimeout(() => {
         if (!ttsStarted) {
+          console.log('TTS start safety timeout triggered, forcing idle state');
           setUIState('idle');
         }
-      }, 1000);
+      }, 2500); // 2.5s fallback to allow slow initialization on mobile
+
+      try {
+        window.speechSynthesis.speak(utterance);
+      } catch (err) {
+        console.error('speechSynthesis.speak exception:', err);
+        setUIState('idle');
+      }
     }
     
     // ============================================================
